@@ -33,9 +33,20 @@ static const char *__doc__=
 #include <libgen.h>  /* dirname */
 
 #include <arpa/inet.h>
+#include <bpf/bpf.h>
+#include <bpf/libbpf.h>
 #include <linux/if_link.h>
 
-#include "bpf_load.h"
+#define MAX_MAPS 32
+const char *prefix = "/sys/fs/bpf/";
+struct bpf_map_data {
+	int fd;
+	char *name;
+	size_t elf_offset;
+	struct bpf_map_def def;
+};
+extern struct bpf_map_data map_data[MAX_MAPS];
+//#include "bpf_load.h"
 #include "bpf_util.h"
 #include "libbpf.h"
 
@@ -81,7 +92,7 @@ static void remove_xdp_program(int ifindex, const char *ifname, __u32 xdp_flags)
 	fprintf(stderr, "Removing XDP program on ifindex:%d device:%s\n",
 		ifindex, ifname);
 	if (ifindex > -1)
-		set_link_xdp_fd(ifindex, -1, xdp_flags);
+		bpf_set_link_xdp_fd(ifindex, -1, xdp_flags);
 
 	/* Remove all exported map file */
 	for (i = 0; i < NR_MAPS; i++) {
@@ -101,6 +112,7 @@ static const struct option long_options[] = {
 	{"quiet",	no_argument,		NULL, 'q' },
 	{"owner",	required_argument,	NULL, 'o' },
 	{"skb-mode",	no_argument,		NULL, 'S' },
+	{"nic-offload",	no_argument,		NULL, 'n' },
 	{0, 0, NULL,  0 }
 };
 
@@ -124,125 +136,34 @@ static void usage(char *argv[])
 	printf("\n");
 }
 
-#ifndef BPF_FS_MAGIC
-# define BPF_FS_MAGIC   0xcafe4a11
-#endif
-
-/* Verify BPF-filesystem is mounted on given file path */
-static int bpf_fs_check_path(const char *path)
+static void do_pinning(struct bpf_object *obj, char *filename, char *map_name)
 {
-	struct statfs st_fs;
-	char *dname, *dir;
-	int err = 0;
+	struct bpf_map *map;
+	char path[256];
+	int fixed_len;
+	int map_fd;
 
-	if (path == NULL)
-		return -EINVAL;
+	fixed_len = strlen(prefix) + 1;
+	snprintf(path, sizeof(path) - fixed_len, "%s%s", prefix, filename);
 
-	dname = strdup(path);
-	if (dname == NULL)
-		return -ENOMEM;
-
-	dir = dirname(dname);
-	if (statfs(dir, &st_fs)) {
-		fprintf(stderr, "ERR: failed to statfs %s: (%d)%s\n",
-			dir, errno, strerror(errno));
-		err = -errno;
-	}
-	free(dname);
-
-	if (!err && st_fs.f_type != BPF_FS_MAGIC) {
-		fprintf(stderr,
-			"ERR: specified path %s is not on BPF FS\n\n"
-			" You need to mount the BPF filesystem type like:\n"
-			"  mount -t bpf bpf /sys/fs/bpf/\n\n",
-			path);
-		err = -EINVAL;
+	map = bpf_object__find_map_by_name(obj, map_name);
+	if (!map) {
+		printf("failed to find map %s\n", map_name);
+		bpf_object__close(obj);
 	}
 
-	return err;
-}
-
-/* Load existing map via filesystem, if possible */
-int load_map_file(const char *file, struct bpf_map_data *map_data)
-{
-	int fd;
-
-	if (bpf_fs_check_path(file) < 0) {
-		exit(EXIT_FAIL_MAP_FS);
+	map_fd = bpf_map__fd(map);
+	if (map_fd < 0) {
+		printf("failed to find map fd for server mapping\n");
+		bpf_object__close(obj);
 	}
 
-	fd = bpf_obj_get(file);
-	if (fd > 0) { /* Great: map file already existed use it */
-		// FIXME: Verify map size etc is the same before returning it!
-		// data available via map->def.XXX and fdinfo
-		if (verbose)
-			printf(" - Loaded bpf-map:%-30s from file:%s\n",
-			       map_data->name, file);
-		return fd;
+	if (bpf_obj_pin(map_fd, path)) {
+		printf("failed to pin map: %s\n", strerror(errno));
+		bpf_object__close(obj);
 	}
-	return -1;
-}
 
-/* Map callback
- * ------------
- * The bpf-ELF loader (bpf_load.c) got support[1] for a callback, just
- * before creating the map (via bpf_create_map()).  It allow assigning
- * another FD and skips map creation.
- *
- * Using this to load map FD from via filesystem, if possible.  One
- * problem, cannot handle exporting the map here, as creation happens
- * after this step.
- *
- * [1] kernel commit 6979bcc731f9 ("samples/bpf: load_bpf.c make
- * callback fixup more flexible")
- */
-void pre_load_maps_via_fs(struct bpf_map_data *map_data, int idx)
-{
-	/* This callback gets invoked for every map in ELF file */
-	const char *file;
-	int fd;
-
-	file = map_idx_to_export_filename(idx);
-	fd = load_map_file(file, map_data);
-
-	if (fd > 0) {
-		/* Makes bpf_load.c skip creating map */
-		map_data->fd = fd;
-	} else {
-		/* When map was NOT loaded from filesystem, then
-		 * bpf_load.c will create it. Mark map idx to get
-		 * it exported later
-		 */
-		maps_marked_for_export[idx] = 1;
-	}
-}
-
-int export_map_idx(int map_idx)
-{
-	const char *file;
-
-	file = map_idx_to_export_filename(map_idx);
-
-	/* Export map as a file */
-	if (bpf_obj_pin(map_fd[map_idx], file) != 0) {
-		fprintf(stderr, "ERR: Cannot pin map(%s) file:%s err(%d):%s\n",
-			map_data[map_idx].name, file, errno, strerror(errno));
-		return EXIT_FAIL_MAP;
-	}
-	if (verbose)
-		printf(" - Export bpf-map:%-30s to   file:%s\n",
-		       map_data[map_idx].name, file);
-	return 0;
-}
-
-void export_maps(void)
-{
-	int i;
-
-	for (i = 0; i < NR_MAPS; i++) {
-		if (maps_marked_for_export[i] == 1)
-			export_map_idx(i);
-	}
+	printf("Pinned map at %s\n", path);
 }
 
 void chown_maps(uid_t owner, gid_t group)
@@ -265,14 +186,20 @@ void chown_maps(uid_t owner, gid_t group)
 
 int main(int argc, char **argv)
 {
+	struct bpf_prog_load_attr prog_load_attr = {
+		.prog_type = BPF_PROG_TYPE_XDP,
+		.file = "xdp_ddos01_blacklist_kern.o",
+	};
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
 	bool rm_xdp_prog = false;
 	struct passwd *pwd = NULL;
+	struct bpf_object *obj;
 	__u32 xdp_flags = 0;
 	char filename[256];
 	int longindex = 0;
 	uid_t owner = -1; /* -1 result in no-change of owner */
 	gid_t group = -1;
+	int prog_fd;
 	int opt;
 
 	snprintf(filename, sizeof(filename), "%s_kern.o", argv[0]);
@@ -315,6 +242,9 @@ int main(int argc, char **argv)
 		case 'S':
 			xdp_flags |= XDP_FLAGS_SKB_MODE;
 			break;
+		case 'n':
+			xdp_flags |= XDP_FLAGS_HW_MODE;
+			break;
 		case 'h':
 		error:
 		default:
@@ -344,31 +274,33 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* Load bpf-ELF file with callback for loading maps via filesystem */
-	if (load_bpf_file_fixup_map(filename, pre_load_maps_via_fs)) {
-		fprintf(stderr, "ERR in load_bpf_file(): %s", bpf_log_buf);
-		return EXIT_FAIL;
-	}
+	if (xdp_flags & XDP_FLAGS_HW_MODE)
+		prog_load_attr.ifindex = ifindex;
 
-	if (!prog_fd[0]) {
+	if (bpf_prog_load_xattr(&prog_load_attr, &obj, &prog_fd)) {
 		printf("load_bpf_file: %s\n", strerror(errno));
-		return 1;
+		return -1;
 	}
 
-	/* Export maps that were not loaded from filesystem */
-	export_maps();
+	if (prog_fd < 1) {
+		printf("error creating prog_fd\n");
+		bpf_object__close(obj);
+		return -1;
+	}
 
+	do_pinning(obj, "ddos_blacklist", "blacklist");
+	do_pinning(obj, "ddos_blacklist_stat_verdict", "verdict_cnt");
+	do_pinning(obj, "ddos_port_blacklist", "port_blacklist");
+	do_pinning(obj, "ddos_port_blacklist_count_tcp", "port_blacklist_drop_count_tcp");
+	do_pinning(obj, "ddos_port_blacklist_count_udp", "port_blacklist_drop_count_udp");
 	if (owner >= 0)
 		chown_maps(owner, group);
 
-	if (set_link_xdp_fd(ifindex, prog_fd[0], xdp_flags) < 0) {
-		printf("link set xdp fd failed\n");
-		return EXIT_FAIL_XDP;
+	if (bpf_set_link_xdp_fd(ifindex, prog_fd, xdp_flags) < 0) {
+		printf("error setting fd onto xdp\n");
+		bpf_object__close(obj);
+		return(-1);
 	}
-
-	/* Add something to the map as a test */
-	blacklist_modify(map_fd[0], "198.18.50.3", ACTION_ADD);
-	blacklist_port_modify(map_fd[2], map_fd[4], 80, ACTION_ADD, IPPROTO_UDP);
 
 	return EXIT_OK;
 }
