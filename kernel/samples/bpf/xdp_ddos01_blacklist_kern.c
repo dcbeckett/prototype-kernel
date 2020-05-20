@@ -26,25 +26,24 @@ struct vlan_hdr {
 };
 
 struct bpf_map_def SEC("maps") blacklist = {
-	.type        = BPF_MAP_TYPE_PERCPU_HASH,
+	.type        = BPF_MAP_TYPE_HASH,
 	.key_size    = sizeof(u32),
 	.value_size  = sizeof(u64), /* Drop counter */
 	.max_entries = 100000,
-	.map_flags   = BPF_F_NO_PREALLOC,
 };
 
 #define XDP_ACTION_MAX (XDP_TX + 1)
 
 /* Counter per XDP "action" verdict */
 struct bpf_map_def SEC("maps") verdict_cnt = {
-	.type = BPF_MAP_TYPE_PERCPU_ARRAY,
+	.type = BPF_MAP_TYPE_ARRAY,
 	.key_size = sizeof(u32),
 	.value_size = sizeof(long),
 	.max_entries = XDP_ACTION_MAX,
 };
 
 struct bpf_map_def SEC("maps") port_blacklist = {
-	.type        = BPF_MAP_TYPE_PERCPU_ARRAY,
+	.type        = BPF_MAP_TYPE_ARRAY,
 	.key_size    = sizeof(u32),
 	.value_size  = sizeof(u32),
 	.max_entries = 65536,
@@ -54,7 +53,7 @@ struct bpf_map_def SEC("maps") port_blacklist = {
 
 /* TCP Drop counter */
 struct bpf_map_def SEC("maps") port_blacklist_drop_count_tcp = {
-	.type        = BPF_MAP_TYPE_PERCPU_ARRAY,
+	.type        = BPF_MAP_TYPE_ARRAY,
 	.key_size    = sizeof(u32),
 	.value_size  = sizeof(u64),
 	.max_entries = 65536,
@@ -62,7 +61,7 @@ struct bpf_map_def SEC("maps") port_blacklist_drop_count_tcp = {
 
 /* UDP Drop counter */
 struct bpf_map_def SEC("maps") port_blacklist_drop_count_udp = {
-	.type        = BPF_MAP_TYPE_PERCPU_ARRAY,
+	.type        = BPF_MAP_TYPE_ARRAY,
 	.key_size    = sizeof(u32),
 	.value_size  = sizeof(u64),
 	.max_entries = 65536,
@@ -109,7 +108,7 @@ void stats_action_verdict(u32 action)
 
 	value = bpf_map_lookup_elem(&verdict_cnt, &action);
 	if (value)
-		*value += 1;
+		__sync_fetch_and_add(value, 1);
 }
 
 /* Parse Ethernet layer 2, extract network layer 3 offset and protocol
@@ -205,7 +204,7 @@ u32 parse_port(struct xdp_md *ctx, u8 proto, void *hdr)
 			if (drop_counter) {
 				drops = bpf_map_lookup_elem(drop_counter , &dport_idx);
 				if (drops)
-					*drops += 1; /* Keep a counter for drop matches */
+					__sync_fetch_and_add(drops, 1);
 			}
 			return XDP_DROP;
 		}
@@ -235,8 +234,7 @@ u32 parse_ipv4(struct xdp_md *ctx, u64 l3_offset)
 
 	value = bpf_map_lookup_elem(&blacklist, &ip_src);
 	if (value) {
-		/* Don't need __sync_fetch_and_add(); as percpu map */
-		*value += 1; /* Keep a counter for drop matches */
+		__sync_fetch_and_add(value, 1);
 		return XDP_DROP;
 	}
 
